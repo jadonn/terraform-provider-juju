@@ -13,6 +13,7 @@ const (
 	PrefixModel         = "model-"
 	PrefixCharm         = "charm-"
 	PrefixUser          = "user-"
+	PrefixMachine       = "machine-"
 	UnspecifiedRevision = -1
 	connectionTimeout   = 30 * time.Second
 )
@@ -25,10 +26,14 @@ type Configuration struct {
 }
 
 type Client struct {
-	Models       modelsClient
 	Applications applicationsClient
+	Machines     machinesClient
+	Credentials  credentialsClient
 	Integrations integrationsClient
+	Models       modelsClient
 	Offers       offersClient
+	SSHKeys      sshKeysClient
+	Users        usersClient
 }
 
 type ConnectionFactory struct {
@@ -41,10 +46,14 @@ func NewClient(config Configuration) (*Client, error) {
 	}
 
 	return &Client{
-		Models:       *newModelsClient(cf),
 		Applications: *newApplicationClient(cf),
+		Credentials:  *newCredentialsClient(cf),
 		Integrations: *newIntegrationsClient(cf),
+		Machines:     *newMachinesClient(cf),
+		Models:       *newModelsClient(cf),
 		Offers:       *newOffersClient(cf),
+		SSHKeys:      *newSSHKeysClient(cf),
+		Users:        *newUsersClient(cf),
 	}, nil
 }
 

@@ -9,6 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/juju/juju/core/model"
@@ -25,6 +28,7 @@ import (
 	apiresources "github.com/juju/juju/api/client/resources"
 	"github.com/juju/juju/cmd/juju/application/utils"
 	"github.com/juju/juju/core/constraints"
+	"github.com/juju/juju/core/instance"
 	"github.com/juju/juju/environs/config"
 	"github.com/juju/juju/version"
 	"github.com/juju/names/v4"
@@ -32,6 +36,44 @@ import (
 
 type applicationsClient struct {
 	ConnectionFactory
+}
+
+// ConfigEntry is an auxiliar struct to
+// keep information about juju config entries.
+// Specially, we want to know if they have the
+// default value.
+type ConfigEntry struct {
+	Value     interface{}
+	IsDefault bool
+}
+
+// EqualConfigEntries compare two juju configuration entries.
+// If both entries share the same type, otherwise they are
+// considered to be different.
+func EqualConfigEntries(a interface{}, b interface{}) bool {
+	if reflect.TypeOf(a) != reflect.TypeOf(b) {
+		return false
+	}
+	return a == b
+}
+
+func (ce *ConfigEntry) String() string {
+	return ConfigEntryToString(ce.Value)
+}
+
+// ConfigEntryToString returns the string representation based on
+// the current value.
+func ConfigEntryToString(input interface{}) string {
+	switch t := input.(type) {
+	case bool:
+		return strconv.FormatBool(t)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case float64:
+		return strconv.FormatFloat(t, 'f', 0, 64)
+	default:
+		return input.(string)
+	}
 }
 
 type CreateApplicationInput struct {
@@ -44,7 +86,9 @@ type CreateApplicationInput struct {
 	Units           int
 	Trust           bool
 	Expose          map[string]interface{}
-	Config          map[string]string
+	Config          map[string]interface{}
+	Placement       string
+	Constraints     constraints.Value
 }
 
 type CreateApplicationResponse struct {
@@ -59,14 +103,17 @@ type ReadApplicationInput struct {
 }
 
 type ReadApplicationResponse struct {
-	Name     string
-	Channel  string
-	Revision int
-	Series   string
-	Units    int
-	Trust    bool
-	Config   map[string]string
-	Expose   map[string]interface{}
+	Name        string
+	Channel     string
+	Revision    int
+	Series      string
+	Units       int
+	Trust       bool
+	Config      map[string]ConfigEntry
+	Constraints constraints.Value
+	Expose      map[string]interface{}
+	Principal   bool
+	Placement   string
 }
 
 type UpdateApplicationInput struct {
@@ -80,8 +127,10 @@ type UpdateApplicationInput struct {
 	Expose   map[string]interface{}
 	// Unexpose indicates what endpoints to unexpose
 	Unexpose []string
-	Config   map[string]string
+	Config   map[string]interface{}
 	//Series    string // TODO: Unsupported for now
+	Placement   map[string]interface{}
+	Constraints *constraints.Value
 }
 
 type DestroyApplicationInput struct {
@@ -109,6 +158,14 @@ func resolveCharmURL(charmName string) (*charm.URL, error) {
 }
 
 func (c applicationsClient) CreateApplication(input *CreateApplicationInput) (*CreateApplicationResponse, error) {
+	appName := input.ApplicationName
+	if appName == "" {
+		appName = input.CharmName
+	}
+	if err := names.ValidateApplicationName(appName); err != nil {
+		return nil, err
+	}
+
 	conn, err := c.GetConnection(&input.ModelUUID)
 	if err != nil {
 		return nil, err
@@ -132,14 +189,6 @@ func (c applicationsClient) CreateApplication(input *CreateApplicationInput) (*C
 	}
 
 	defer resourcesAPIClient.Close()
-
-	appName := input.ApplicationName
-	if appName == "" {
-		appName = input.CharmName
-	}
-	if err := names.ValidateApplicationName(appName); err != nil {
-		return nil, err
-	}
 
 	channel, err := charm.ParseChannel(input.CharmChannel)
 	if err != nil {
@@ -261,16 +310,36 @@ func (c applicationsClient) CreateApplication(input *CreateApplicationInput) (*C
 		return nil, err
 	}
 
-	// TODO: This should probably be set within the schema
-	// For now this is the default required behaviour
+	// The deploy API endpoint expects string values for the
+	// constraints.
 	var appConfig map[string]string
-	if input.Config != nil {
-		appConfig = input.Config
-	} else {
+	if input.Config == nil {
 		appConfig = make(map[string]string)
+	} else {
+		appConfig = make(map[string]string, len(input.Config))
+		for k, v := range input.Config {
+			appConfig[k] = ConfigEntryToString(v)
+		}
 	}
 
 	appConfig["trust"] = fmt.Sprintf("%v", input.Trust)
+
+	placements := []*instance.Placement{}
+	if input.Placement == "" {
+		placements = nil
+	} else {
+		placementDirectives := strings.Split(input.Placement, ",")
+		// force this to be sorted
+		sort.Strings(placementDirectives)
+
+		for _, directive := range placementDirectives {
+			appPlacement, err := instance.ParsePlacement(directive)
+			if err != nil {
+				return nil, err
+			}
+			placements = append(placements, appPlacement)
+		}
+	}
 
 	err = applicationAPIClient.Deploy(apiapplication.DeployArgs{
 		CharmID:         charmID,
@@ -279,7 +348,9 @@ func (c applicationsClient) CreateApplication(input *CreateApplicationInput) (*C
 		Series:          resultOrigin.Series,
 		CharmOrigin:     resultOrigin,
 		Config:          appConfig,
+		Cons:            input.Constraints,
 		Resources:       resources,
+		Placement:       placements,
 	})
 
 	if err != nil {
@@ -294,6 +365,7 @@ func (c applicationsClient) CreateApplication(input *CreateApplicationInput) (*C
 	// If we have managed to deploy something, now we have
 	// to check if we have to expose something
 	err = c.processExpose(applicationAPIClient, input.ApplicationName, input.Expose)
+
 	return &CreateApplicationResponse{
 		AppName:  appName,
 		Revision: *origin.Revision,
@@ -443,6 +515,20 @@ func (c applicationsClient) ReadApplication(input *ReadApplicationInput) (*ReadA
 	}
 	appInfo := apps[0].Result
 
+	var appConstraints constraints.Value = constraints.Value{}
+	// constraints do not apply to subordinate applications.
+	if appInfo.Principal {
+		queryConstraints, err := applicationAPIClient.GetConstraints(input.AppName)
+		if err != nil {
+			log.Error().Err(err).Msg("found when querying the application constraints")
+			return nil, err
+		}
+		if len(queryConstraints) != 1 {
+			return nil, fmt.Errorf("expected one set of application constraints, received %d", len(queryConstraints))
+		}
+		appConstraints = queryConstraints[0]
+	}
+
 	status, err := clientAPIClient.Status(nil)
 	if err != nil {
 		return nil, err
@@ -452,6 +538,17 @@ func (c applicationsClient) ReadApplication(input *ReadApplicationInput) (*ReadA
 	if appStatus, exists = status.Applications[input.AppName]; !exists {
 		return nil, fmt.Errorf("no status returned for application: %s", input.AppName)
 	}
+
+	allocatedMachines := make([]string, 0)
+	placementCount := 0
+	for _, v := range appStatus.Units {
+		allocatedMachines = append(allocatedMachines, v.Machine)
+		placementCount += 1
+	}
+	// sort the list
+	sort.Strings(allocatedMachines)
+
+	placement := strings.Join(allocatedMachines, ",")
 
 	unitCount := len(appStatus.Units)
 
@@ -466,7 +563,7 @@ func (c applicationsClient) ReadApplication(input *ReadApplicationInput) (*ReadA
 		return nil, fmt.Errorf("failed to get app configuration %v", err)
 	}
 
-	conf := make(map[string]string, 0)
+	conf := make(map[string]ConfigEntry, 0)
 	if returnedConf.ApplicationConfig != nil {
 		for k, v := range returnedConf.ApplicationConfig {
 			// skip the trust value. We have an independent field for that
@@ -474,28 +571,23 @@ func (c applicationsClient) ReadApplication(input *ReadApplicationInput) (*ReadA
 				continue
 			}
 			// The API returns the configuration entries as interfaces
-			// In the terraform plan we introduce strings...
-			// so we force this conversion
 			aux := v.(map[string]interface{})
 			// set if we find the value key and this is not a default
 			// value.
-			// TODO this returns a dictonary with entries using different
-			// type values. Cast the value to the corresponding type.
-			// indicated in the type field"
-			isDefault, found := aux["source"]
-			if found && isDefault != "default" {
-				if value, found := aux["value"]; found {
-					conf[k] = fmt.Sprintf("%s", value)
+			if value, found := aux["value"]; found {
+				conf[k] = ConfigEntry{
+					Value:     value,
+					IsDefault: aux["source"] == "default",
 				}
 			}
 		}
 		// repeat the same steps for charm config values
 		for k, v := range returnedConf.CharmConfig {
 			aux := v.(map[string]interface{})
-			isDefault, found := aux["source"]
-			if found && isDefault != "default" {
-				if value, found := aux["value"]; found {
-					conf[k] = fmt.Sprintf("%s", value)
+			if value, found := aux["value"]; found {
+				conf[k] = ConfigEntry{
+					Value:     value,
+					IsDefault: aux["source"] == "default",
 				}
 			}
 		}
@@ -546,14 +638,17 @@ func (c applicationsClient) ReadApplication(input *ReadApplicationInput) (*ReadA
 	}
 
 	response := &ReadApplicationResponse{
-		Name:     charmURL.Name,
-		Channel:  appStatus.CharmChannel,
-		Revision: charmURL.Revision,
-		Series:   appInfo.Series,
-		Units:    unitCount,
-		Trust:    trustValue,
-		Expose:   exposed,
-		Config:   conf,
+		Name:        charmURL.Name,
+		Channel:     appStatus.CharmChannel,
+		Revision:    charmURL.Revision,
+		Series:      appInfo.Series,
+		Units:       unitCount,
+		Trust:       trustValue,
+		Expose:      exposed,
+		Config:      conf,
+		Constraints: appConstraints,
+		Principal:   appInfo.Principal,
+		Placement:   placement,
 	}
 
 	return response, nil
@@ -601,7 +696,13 @@ func (c applicationsClient) UpdateApplication(input *UpdateApplicationInput) err
 	}
 
 	// process configuration
-	auxConfig := input.Config
+	var auxConfig map[string]string
+	if input.Config != nil {
+		auxConfig = make(map[string]string)
+		for k, v := range input.Config {
+			auxConfig[k] = ConfigEntryToString(v)
+		}
+	}
 
 	// trust goes inside the config
 	if input.Trust != nil {
@@ -630,10 +731,6 @@ func (c applicationsClient) UpdateApplication(input *UpdateApplicationInput) err
 	// expose endpoints if required
 	if input.Expose != nil {
 		log.Trace().Interface("endpoints", input.Unexpose).Msg("Expose endpoints")
-		// exposeMap := make(map[string]string)
-		// for k, v := range input.Expose {
-		// 	exposeMap[k] = v.(string)
-		// }
 		err := c.processExpose(applicationAPIClient, input.AppName, input.Expose)
 		if err != nil {
 			log.Error().Err(err).Msg("error when trying to expose")
@@ -732,6 +829,15 @@ func (c applicationsClient) UpdateApplication(input *UpdateApplicationInput) err
 			return err
 		}
 	}
+
+	if input.Constraints != nil {
+		err := applicationAPIClient.SetConstraints(input.AppName, *input.Constraints)
+		if err != nil {
+			log.Error().Err(err).Msg("error setting application constraints")
+			return err
+		}
+	}
+
 	return nil
 }
 

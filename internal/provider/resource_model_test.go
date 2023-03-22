@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
@@ -15,6 +16,7 @@ import (
 
 func TestAcc_ResourceModel_Basic(t *testing.T) {
 	modelName := acctest.RandomWithPrefix("tf-test-model")
+	modelInvalidName := acctest.RandomWithPrefix("tf_test_model")
 	logLevelInfo := "INFO"
 	logLevelDebug := "DEBUG"
 
@@ -23,6 +25,13 @@ func TestAcc_ResourceModel_Basic(t *testing.T) {
 		PreCheck:          func() { testAccPreCheck(t) },
 		ProviderFactories: providerFactories,
 		Steps: []resource.TestStep{
+			{
+				// Mind that ExpectError should be the first step
+				// "When tests have an ExpectError[...]; this results in any previous state being cleared. "
+				// https://github.com/hashicorp/terraform-plugin-sdk/issues/118
+				Config:      testAccResourceModel(t, modelInvalidName, logLevelInfo),
+				ExpectError: regexp.MustCompile(fmt.Sprintf("Error: \"%s\" is not a valid name: model names may only contain lowercase letters, digits and hyphens", modelInvalidName)),
+			},
 			{
 				Config: testAccResourceModel(t, modelName, logLevelInfo),
 				Check: resource.ComposeTestCheckFunc(
@@ -34,6 +43,12 @@ func TestAcc_ResourceModel_Basic(t *testing.T) {
 				Config: testAccResourceModel(t, modelName, logLevelDebug),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(resourceName, "config.logging-config", fmt.Sprintf("<root>=%s", logLevelDebug)),
+				),
+			},
+			{
+				Config: testAccConstraintsModel(t, modelName, "cores=1 mem=1024M"),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "constraints", "cores=1 mem=1024M"),
 				),
 			},
 			{
@@ -140,4 +155,18 @@ resource "juju_model" "model" {
     logging-config = "<root>=%s"
   }
 }`, modelName, logLevel)
+}
+
+func testAccConstraintsModel(t *testing.T, modelName string, constraints string) string {
+	return fmt.Sprintf(`
+resource "juju_model" "model" {
+  name = %q
+
+  cloud {
+   name   = "localhost"
+   region = "localhost"
+  }
+
+  constraints = "%s"
+}`, modelName, constraints)
 }

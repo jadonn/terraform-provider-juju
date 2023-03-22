@@ -26,11 +26,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
-        with:
-          go-version-file: "go.mod"
-          cache: true
-      - run: go mod download
+      - uses: actions/setup-go@v4
       - run: go build -v .
 
   generate:
@@ -38,7 +34,7 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version-file: "go.mod"
           cache: true
@@ -55,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version-file: "go.mod"
       - name: golangci-lint
@@ -70,7 +66,6 @@ jobs:
       - generate
       - lint
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -79,10 +74,10 @@ jobs:
           - "1.0.*"
           - "1.1.*"
           - "1.2.*"
-
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
           go-version-file: "go.mod"
           cache: true
@@ -109,5 +104,5 @@ jobs:
       - run: go mod download
       - env:
           TF_ACC: "1"
-        run: go test -v -cover ./internal/provider/
-        timeout-minutes: 10
+        run: go test -timeout 30m -v -cover ./internal/provider/
+        timeout-minutes: 30

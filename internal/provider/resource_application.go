@@ -3,11 +3,14 @@ package provider
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-
+	"github.com/juju/juju/core/constraints"
+	"github.com/juju/juju/core/instance"
 	"github.com/juju/terraform-provider-juju/internal/juju"
 )
 
@@ -51,7 +54,7 @@ func resourceApplication() *schema.Resource {
 							ForceNew:    true,
 						},
 						"channel": {
-							Description: "The channel to use when deploying a charm. Specified as <track>/<risk>/<branch>.",
+							Description: "The channel to use when deploying a charm. Specified as \\<track>/\\<risk>/\\<branch>.",
 							Type:        schema.TypeString,
 							Default:     "latest/stable",
 							Optional:    true,
@@ -84,6 +87,13 @@ func resourceApplication() *schema.Resource {
 				DefaultFunc: func() (interface{}, error) {
 					return make(map[string]interface{}), nil
 				},
+			},
+			"constraints": {
+				Description: "Constraints imposed on this application.",
+				Type:        schema.TypeString,
+				Optional:    true,
+				// Set as "computed" to pre-populate and preserve any implicit constraints
+				Computed: true,
 			},
 			"trust": {
 				Description: "Set the trust for the application.",
@@ -120,6 +130,83 @@ func resourceApplication() *schema.Resource {
 					},
 				},
 			},
+			"placement": {
+				Description: "Specify the target location for the application's units",
+				Type:        schema.TypeString,
+				Optional:    true,
+				Computed:    true,
+				DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+					oldDirectives := strings.Split(old, ",")
+					newDirectives := strings.Split(new, ",")
+
+					sort.Strings(oldDirectives)
+					sort.Strings(newDirectives)
+					if len(oldDirectives) != len(newDirectives) {
+						return false
+					}
+					var oldPlacements []string
+					for index := 0; index < len(oldDirectives); index++ {
+						oldPlacement, _ := instance.ParsePlacement(oldDirectives[index])
+						if oldPlacement == nil {
+							oldPlacements = append(oldPlacements, "")
+						} else {
+							var oldPlacementBuilder strings.Builder
+							if oldPlacement.Scope == "#" {
+								splitDirective := strings.Split(oldPlacement.Directive, "/")
+								if len(splitDirective) == 3 && splitDirective[1] == "lxd" {
+									oldPlacementBuilder.WriteString(splitDirective[1])
+									oldPlacementBuilder.WriteString(":")
+									oldPlacementBuilder.WriteString(splitDirective[0])
+									oldPlacements = append(oldPlacements, oldPlacementBuilder.String())
+								} else {
+									oldPlacements = append(oldPlacements, oldPlacement.Directive)
+								}
+							} else if oldPlacement.Scope == "lxd" {
+								oldPlacementBuilder.WriteString(oldPlacement.Scope)
+								oldPlacementBuilder.WriteString(":")
+								oldPlacementBuilder.WriteString(oldPlacement.Directive)
+								oldPlacements = append(oldPlacements, oldPlacementBuilder.String())
+							} else {
+								oldPlacements = append(oldPlacements, oldPlacement.Scope)
+							}
+						}
+					}
+					var newPlacements []string
+					for index := 0; index < len(newDirectives); index++ {
+						newPlacement, _ := instance.ParsePlacement(newDirectives[index])
+
+						if newPlacement == nil {
+							newPlacements = append(newPlacements, "")
+						} else {
+							var newPlacementBuilder strings.Builder
+							if newPlacement.Scope == "#" {
+								splitDirective := strings.Split(newPlacement.Directive, "/")
+								if len(splitDirective) == 3 && splitDirective[1] == "lxd" {
+									newPlacementBuilder.WriteString(splitDirective[1])
+									newPlacementBuilder.WriteString(":")
+									newPlacementBuilder.WriteString(splitDirective[0])
+									newPlacements = append(newPlacements, newPlacementBuilder.String())
+								} else {
+									newPlacements = append(newPlacements, newPlacement.Directive)
+								}
+							} else if newPlacement.Scope == "lxd" {
+								newPlacementBuilder.WriteString(newPlacement.Scope)
+								newPlacementBuilder.WriteString(":")
+								newPlacementBuilder.WriteString(newPlacement.Directive)
+								newPlacements = append(newPlacements, newPlacementBuilder.String())
+							} else {
+								newPlacements = append(newPlacements, newPlacement.Scope)
+							}
+						}
+					}
+					return reflect.DeepEqual(oldPlacements, newPlacements)
+				},
+			},
+			"principal": {
+				Description: "Whether this is a Principal application",
+				Type:        schema.TypeBool,
+				Computed:    true,
+			},
 		},
 	}
 }
@@ -140,12 +227,12 @@ func resourceApplicationCreate(ctx context.Context, d *schema.ResourceData, meta
 	series := charm["series"].(string)
 	units := d.Get("units").(int)
 	trust := d.Get("trust").(bool)
+	placement := d.Get("placement").(string)
 	// populate the config parameter
+	// terraform only permits a single type. We have to treat
+	// strings to have different types
 	configField := d.Get("config").(map[string]interface{})
-	config := make(map[string]string)
-	for k, v := range configField {
-		config[k] = v.(string)
-	}
+
 	// if expose is nil, it was not defined
 	var expose map[string]interface{} = nil
 	exposeField, exposeWasSet := d.GetOk("expose")
@@ -163,6 +250,15 @@ func resourceApplicationCreate(ctx context.Context, d *schema.ResourceData, meta
 		revision = -1
 	}
 
+	var parsedConstraints constraints.Value = constraints.Value{}
+	readConstraints := d.Get("constraints").(string)
+	if readConstraints != "" {
+		parsedConstraints, err = constraints.Parse(readConstraints)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
 	response, err := client.Applications.CreateApplication(&juju.CreateApplicationInput{
 		ApplicationName: name,
 		ModelUUID:       modelUUID,
@@ -171,9 +267,11 @@ func resourceApplicationCreate(ctx context.Context, d *schema.ResourceData, meta
 		CharmRevision:   revision,
 		CharmSeries:     series,
 		Units:           units,
-		Config:          config,
+		Config:          configField,
+		Constraints:     parsedConstraints,
 		Trust:           trust,
 		Expose:          expose,
+		Placement:       placement,
 	})
 
 	if err != nil {
@@ -194,7 +292,7 @@ func resourceApplicationCreate(ctx context.Context, d *schema.ResourceData, meta
 	id := fmt.Sprintf("%s:%s", modelName, response.AppName)
 	d.SetId(id)
 
-	return nil
+	return resourceApplicationRead(ctx, d, meta)
 }
 
 func resourceApplicationRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
@@ -257,6 +355,17 @@ func resourceApplicationRead(ctx context.Context, d *schema.ResourceData, meta i
 		return diag.FromErr(err)
 	}
 
+	if err = d.Set("principal", response.Principal); err != nil {
+		return diag.FromErr(err)
+	}
+
+	// constraints do not apply to subordinate applications.
+	if response.Principal {
+		if err = d.Set("constraints", response.Constraints.String()); err != nil {
+			return diag.FromErr(err)
+		}
+	}
+
 	var exposeValue []map[string]interface{} = nil
 	if response.Expose != nil {
 		exposeValue = []map[string]interface{}{response.Expose}
@@ -269,12 +378,24 @@ func resourceApplicationRead(ctx context.Context, d *schema.ResourceData, meta i
 	// are not the default value. If the value was the same
 	// we ignore it. If no changes were made, jump to the
 	// next step.
+	// Terraform does not allow to have several types
+	// for a schema attribute. We have to transform the string
+	// with the potential type we want to compare with.
 	previousConfig := d.Get("config").(map[string]interface{})
+	// known previously
 	// update the values from the previous config
 	changes := false
 	for k, v := range response.Config {
-		if previousConfig[k] != v {
-			previousConfig[k] = v
+		// Add if the value has changed from the previous state
+		if previousValue, found := previousConfig[k]; found {
+			if !juju.EqualConfigEntries(v, previousValue) {
+				// remember that this terraform schema type only accepts strings
+				previousConfig[k] = v.String()
+				changes = true
+			}
+		} else if !v.IsDefault {
+			// Add if the value is not default
+			previousConfig[k] = v.String()
 			changes = true
 		}
 	}
@@ -284,6 +405,10 @@ func resourceApplicationRead(ctx context.Context, d *schema.ResourceData, meta i
 		if err = d.Set("config", previousConfig); err != nil {
 			return diag.FromErr(err)
 		}
+	}
+
+	if err = d.Set("placement", response.Placement); err != nil {
+		return diag.FromErr(err)
 	}
 
 	return nil
@@ -330,11 +455,31 @@ func resourceApplicationUpdate(ctx context.Context, d *schema.ResourceData, meta
 	}
 
 	if d.HasChange("config") {
-		config := d.Get("config").(map[string]interface{})
-		updateApplicationInput.Config = make(map[string]string, len(config))
-		for k, v := range config {
-			updateApplicationInput.Config[k] = v.(string)
+		oldConfig, newConfig := d.GetChange("config")
+		oldConfigMap := oldConfig.(map[string]interface{})
+		newConfigMap := newConfig.(map[string]interface{})
+		for k, v := range newConfigMap {
+			// we've lost the type of the config value. We compare the string
+			// values.
+			oldEntry := fmt.Sprintf("%#v", oldConfigMap[k])
+			newEntry := fmt.Sprintf("%#v", v)
+			if oldEntry != newEntry {
+				if updateApplicationInput.Config == nil {
+					// initialize just in case
+					updateApplicationInput.Config = make(map[string]interface{})
+				}
+				updateApplicationInput.Config[k] = v
+			}
 		}
+	}
+
+	if d.HasChange("constraints") {
+		_, newConstraints := d.GetChange("constraints")
+		appConstraints, err := constraints.Parse(newConstraints.(string))
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		updateApplicationInput.Constraints = &appConstraints
 	}
 
 	err = client.Applications.UpdateApplication(&updateApplicationInput)
@@ -342,7 +487,7 @@ func resourceApplicationUpdate(ctx context.Context, d *schema.ResourceData, meta
 		return diag.FromErr(err)
 	}
 
-	return nil
+	return resourceApplicationRead(ctx, d, meta)
 }
 
 // computeExposeDeltas computes the differences between the previously
